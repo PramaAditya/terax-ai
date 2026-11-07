@@ -127,14 +127,20 @@ pub fn serve<R: Runtime>(
 }
 
 fn response(status: u16, mime: &str, body: Vec<u8>) -> Response<Vec<u8>> {
+    response_with_csp(
+        status,
+        mime,
+        "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        body,
+    )
+}
+
+fn response_with_csp(status: u16, mime: &str, csp: &str, body: Vec<u8>) -> Response<Vec<u8>> {
     Response::builder()
         .status(status)
         .header("Content-Type", mime)
         .header("X-Content-Type-Options", "nosniff")
-        .header(
-            "Content-Security-Policy",
-            "sandbox; default-src 'none'; style-src 'unsafe-inline'",
-        )
+        .header("Content-Security-Policy", csp)
         .header("Cache-Control", "no-store")
         .header("Referrer-Policy", "no-referrer")
         .body(body)
@@ -149,29 +155,32 @@ fn respond(
     if request.method() != "GET" && request.method() != "HEAD" {
         return Err("unsupported method".into());
     }
-    let token = request
-        .uri()
-        .query()
-        .and_then(|query| query.strip_prefix("token="))
-        .ok_or("missing grant")?;
+    let uri_path = request.uri().path();
+    let (token, raw_path, html_preview_grant) =
+        if let Some(rest) = uri_path.strip_prefix("/grant/") {
+            let (token, raw_path) = rest.split_once('/').ok_or("invalid grant path")?;
+            (token, raw_path, true)
+        } else {
+            let token = request
+                .uri()
+                .query()
+                .and_then(|query| query.strip_prefix("token="))
+                .ok_or("missing grant")?;
+            let raw_path = uri_path.strip_prefix('/').ok_or("invalid path")?;
+            (token, raw_path, false)
+        };
     let grant = grants
         .0
         .lock()
         .unwrap()
         .grants
         .get(token)
-        .filter(|grant| grant.owner == owner)
+        .filter(|grant| grant.owner == owner && (!html_preview_grant || grant.directory))
         .cloned()
         .ok_or("invalid grant")?;
-    let path = percent_encoding::percent_decode_str(
-        request
-            .uri()
-            .path()
-            .strip_prefix('/')
-            .ok_or("invalid path")?,
-    )
-    .decode_utf8()
-    .map_err(|e| e.to_string())?;
+    let path = percent_encoding::percent_decode_str(raw_path)
+        .decode_utf8()
+        .map_err(|e| e.to_string())?;
     let path =
         std::fs::canonicalize(resolve_path(&path, &grant.workspace)).map_err(|e| e.to_string())?;
     if grant.directory {
@@ -195,7 +204,11 @@ fn respond(
     if !within(&actual, &grant) {
         return Err("opened asset escaped its grant".into());
     }
-    let mime = media_type(&actual).ok_or("script-capable documents are not media")?;
+    let mime = if html_preview_grant {
+        preview_type(&actual).ok_or("unsupported preview asset")?
+    } else {
+        media_type(&actual).ok_or("script-capable documents are not media")?
+    };
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("asset is not a regular file".into());
@@ -223,7 +236,17 @@ fn respond(
             .read_to_end(&mut body)
             .map_err(|e| e.to_string())?;
     }
-    let mut result = response(if range.is_some() { 206 } else { 200 }, mime, body);
+    let status = if range.is_some() { 206 } else { 200 };
+    let mut result = if html_preview_grant {
+        response_with_csp(
+            status,
+            mime,
+            "sandbox allow-scripts allow-forms allow-modals",
+            body,
+        )
+    } else {
+        response(status, mime, body)
+    };
     result
         .headers_mut()
         .insert("Accept-Ranges", "bytes".parse().unwrap());
@@ -278,6 +301,28 @@ fn media_type(path: &Path) -> Option<&'static str> {
             "aac" => "audio/aac",
             "m4a" => "audio/mp4",
             "pdf" => "application/pdf",
+            _ => return None,
+        },
+    )
+}
+
+fn preview_type(path: &Path) -> Option<&'static str> {
+    if let Some(mime) = media_type(path) {
+        return Some(mime);
+    }
+    Some(
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "html" | "htm" => "text/html; charset=utf-8",
+            "xhtml" => "application/xhtml+xml",
+            "css" => "text/css; charset=utf-8",
+            "js" | "mjs" => "text/javascript; charset=utf-8",
+            "json" | "map" => "application/json",
+            "wasm" => "application/wasm",
+            "txt" | "csv" | "tsv" | "md" | "xml" => "text/plain; charset=utf-8",
+            "woff2" => "font/woff2",
+            "woff" => "font/woff",
+            "ttf" => "font/ttf",
+            "otf" => "font/otf",
             _ => return None,
         },
     )
@@ -456,5 +501,53 @@ mod tests {
             response.headers()["Content-Security-Policy"],
             "sandbox; default-src 'none'; style-src 'unsafe-inline'"
         );
+    }
+
+    #[test]
+    fn html_preview_directory_grants_serve_bundled_assets_and_block_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let html = dir.path().join("index.html");
+        let css = dir.path().join("style.css");
+        let secret = outside.path().join("secret.html");
+        std::fs::write(&html, "<h1>Hello</h1>").unwrap();
+        std::fs::write(&css, "body { color: red; }").unwrap();
+        std::fs::write(&secret, "<h1>Secret</h1>").unwrap();
+
+        let grants = AssetGrants::default();
+        let token = grants
+            .grant(
+                "main".into(),
+                &super::super::to_canon(dir.path()),
+                WorkspaceEnv::Local,
+                0,
+            )
+            .unwrap();
+        let grant_request = |path: &Path, tok: &str| {
+            let encoded = percent_encoding::utf8_percent_encode(
+                &super::super::to_canon(path),
+                percent_encoding::NON_ALPHANUMERIC,
+            )
+            .to_string();
+            Request::builder()
+                .uri(format!("https://asset.localhost/grant/{tok}/{encoded}"))
+                .body(Vec::new())
+                .unwrap()
+        };
+
+        let html_res = respond(&grants, "main", &grant_request(&html, &token)).unwrap();
+        assert_eq!(html_res.body(), b"<h1>Hello</h1>");
+        assert_eq!(html_res.headers()["Content-Type"], "text/html; charset=utf-8");
+        assert_eq!(
+            html_res.headers()["Content-Security-Policy"],
+            "sandbox allow-scripts allow-forms allow-modals"
+        );
+
+        let css_res = respond(&grants, "main", &grant_request(&css, &token)).unwrap();
+        assert_eq!(css_res.body(), b"body { color: red; }");
+        assert_eq!(css_res.headers()["Content-Type"], "text/css; charset=utf-8");
+
+        assert!(respond(&grants, "main", &grant_request(&secret, &token)).is_err());
+        assert!(respond(&grants, "other", &grant_request(&html, &token)).is_err());
     }
 }

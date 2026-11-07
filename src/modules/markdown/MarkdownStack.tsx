@@ -1,6 +1,17 @@
-import { cn } from "@/lib/utils";
+import { cn, isHtmlPath } from "@/lib/utils";
+import { useSpaces } from "@/modules/spaces/lib/useSpaces";
 import type { MarkdownTab, Tab } from "@/modules/tabs";
-import { MarkdownPreviewPane } from "./MarkdownPreviewPane";
+import { lazy, Suspense } from "react";
+
+// Split so an HTML preview never pulls the markdown renderer and vice versa.
+const MarkdownPreviewPane = lazy(() =>
+  import("./MarkdownPreviewPane").then((m) => ({
+    default: m.MarkdownPreviewPane,
+  })),
+);
+const HtmlPreviewPane = lazy(() =>
+  import("./HtmlPreviewPane").then((m) => ({ default: m.HtmlPreviewPane })),
+);
 
 type Props = {
   tabs: Tab[];
@@ -17,6 +28,7 @@ function workspaceRootOf(tabs: Tab[], activeId: number): string | null {
 }
 
 export function MarkdownStack({ tabs, activeId, onSetMarkdownView }: Props) {
+  const spaces = useSpaces((s) => s.spaces);
   const markdowns = tabs.filter(
     (t): t is MarkdownTab => t.kind === "markdown" && !t.cold,
   );
@@ -26,6 +38,8 @@ export function MarkdownStack({ tabs, activeId, onSetMarkdownView }: Props) {
     <div className="relative h-full w-full">
       {markdowns.map((t) => {
         const visible = t.id === activeId;
+        const onSetView = (mode: "rendered" | "raw") =>
+          onSetMarkdownView(t.id, mode);
         return (
           <div
             key={t.id}
@@ -35,12 +49,24 @@ export function MarkdownStack({ tabs, activeId, onSetMarkdownView }: Props) {
             )}
             aria-hidden={!visible}
           >
-            <MarkdownPreviewPane
-              path={t.path}
-              workspaceRoot={workspaceRoot}
-              visible={visible}
-              onSetView={(mode) => onSetMarkdownView(t.id, mode)}
-            />
+            <Suspense fallback={null}>
+              {isHtmlPath(t.path) ? (
+                <HtmlPreviewPane
+                  path={t.path}
+                  visible={visible}
+                  // The tab's own space, not the active workspace.
+                  env={spaces.find((sp) => sp.id === t.spaceId)?.env}
+                  onSetView={onSetView}
+                />
+              ) : (
+                <MarkdownPreviewPane
+                  path={t.path}
+                  workspaceRoot={workspaceRoot}
+                  visible={visible}
+                  onSetView={onSetView}
+                />
+              )}
+            </Suspense>
           </div>
         );
       })}
