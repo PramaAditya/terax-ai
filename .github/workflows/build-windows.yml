@@ -1,0 +1,87 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish as GitHub Release Draft'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: windows-build
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri Windows Bundle
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ inputs.create_release && format('v0.9.0-{0}', github.run_number) || '' }}
+          releaseName: ${{ inputs.create_release && format('Terax v0.9.0 (Build {0})', github.run_number) || '' }}
+          releaseDraft: true
+          prerelease: false
+
+      - name: Stage Windows installers
+        id: stage
+        shell: pwsh
+        run: |
+          $bundleDir = "src-tauri/target/release/bundle"
+          $outDir = "windows-binaries"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+          # Copy NSIS Setup (.exe) and MSI (.msi)
+          $exe = Get-ChildItem -Path "$bundleDir/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msi = Get-ChildItem -Path "$bundleDir/msi"  -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if ($exe) {
+            Copy-Item $exe.FullName -Destination "$outDir/"
+            Write-Host "Found EXE: $($exe.Name)"
+          } else {
+            Write-Warning "NSIS .exe not found in $bundleDir/nsis"
+          }
+
+          if ($msi) {
+            Copy-Item $msi.FullName -Destination "$outDir/"
+            Write-Host "Found MSI: $($msi.Name)"
+          } else {
+            Write-Warning "MSI installer not found in $bundleDir/msi"
+          }
+
+          Get-ChildItem $outDir
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: terax-windows-x64
+          path: windows-binaries/
+          if-no-files-found: error
