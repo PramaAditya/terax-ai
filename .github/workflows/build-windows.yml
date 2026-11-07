@@ -40,17 +40,22 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Disable updater signing for personal build
+        shell: pwsh
+        run: |
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Path src-tauri/tauri.nosign.conf.json -Encoding utf8
+
       - name: Build Tauri Windows Bundle
         id: tauri
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ inputs.create_release && format('v0.9.0-{0}', github.run_number) || '' }}
-          releaseName: ${{ inputs.create_release && format('Terax v0.9.0 (Build {0})', github.run_number) || '' }}
+          tagName: ${{ inputs.create_release && format('v0.9.1-personal.{0}', github.run_number) || '' }}
+          releaseName: ${{ inputs.create_release && format('Terax v0.9.1-personal (Build {0})', github.run_number) || '' }}
           releaseDraft: true
           prerelease: false
-
+          args: --config src-tauri/tauri.nosign.conf.json
       - name: Stage Windows installers
         id: stage
         shell: pwsh
